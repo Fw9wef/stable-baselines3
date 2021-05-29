@@ -2,8 +2,10 @@ from itertools import zip_longest
 from typing import Dict, List, Tuple, Type, Union
 
 import gym
+import torch
 import torch as th
 from torch import nn
+import torch.nn.functional as F
 
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
 from stable_baselines3.common.type_aliases import TensorDict
@@ -91,6 +93,71 @@ class NatureCNN(BaseFeaturesExtractor):
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
         return self.linear(self.cnn(observations))
+
+
+class BahdanauAttention(nn.Module):
+    def __init__(self, drone_v_dim, points_v_dim, out_dim):
+        super(BahdanauAttention, self).__init__()
+        self.attention_layer = nn.Linear(drone_v_dim+points_v_dim, 1)
+        self.out_layer = nn.Sequential(nn.Linear(drone_v_dim+points_v_dim, out_dim), nn.ReLU())
+
+    def forward(self, points_v, pad_mask, drone_v):
+        batch_size, seq_len = points_v.shape[:2]
+        drone_v = drone_v.unsqueeze(1)
+        drone_v = th.repeat_interleave(drone_v, seq_len, dim=1)
+
+        representation_vectors = th.cat([points_v, drone_v], dim=-1)
+        attention = F.softmax(self.attention_layer(representation_vectors), dim=1)
+
+        general_vector = th.sum(representation_vectors * attention, dim=1)
+        general_vector = self.out_layer(general_vector)
+        return general_vector
+
+
+class TransformerExtractor(nn.Module):
+    def __init__(self, d_model: int = 32, nhead: int = 16, num_encoder_layers: int=12, dim_feedforward: int = 128,
+                 dropout: float = 0.1, bahdanau_out: int = 256, last_layer_dim_pi: int = 4,
+                 last_layer_dim_vf: int = 1, activation: str = 'relu', device: str = 'cuda:0') -> None:
+
+        super(TransformerExtractor, self).__init__()
+        device = torch.device(device)
+
+        self.points_encoding = nn.Sequential(nn.Linear(2, d_model), nn.ReLU()).to(device)
+        self.drone_encoding = nn.Sequential(nn.Linear(4, d_model), nn.ReLU()).to(device)
+
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation)
+        encoder_norm = nn.LayerNorm(d_model)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm).to(device)
+        self.bahdanau_attention = BahdanauAttention(d_model*2, dim_feedforward, bahdanau_out).to(device)
+
+        self.policy_net = nn.Sequential(nn.Linear(bahdanau_out, bahdanau_out), nn.ReLU(),
+                                        nn.Linear(bahdanau_out, last_layer_dim_pi)).to(device)
+        self.value_net = nn.Sequential(nn.Linear(bahdanau_out, bahdanau_out), nn.ReLU(),
+                                       nn.Linear(bahdanau_out, last_layer_dim_vf)).to(device)
+
+        # Save dim, used to create the distributions
+        self.latent_dim_pi = last_layer_dim_pi
+        self.latent_dim_vf = last_layer_dim_vf
+
+    def forward(self, features: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        :return: latent_policy, latent_value of the specified network.
+            If all layers are shared, then ``latent_policy == latent_value``
+        """
+        batch_size = features.shape[0]
+        drones = features[:, :2]
+        points, mask = features[:, 2:, :2], features[:, 2:, 2]
+        drone_mask = torch.zeros((batch_size, 2))
+        mask = torch.cat([drone_mask, mask], dim=1).byte()
+
+        encoded_points = self.points_encoding(points)
+        encoded_drones = self.drone_encoding(drones)
+        encoded_inputs = th.stack([encoded_drones, encoded_points], dim=1)
+
+        extracted_features = self.transformer_encoder(src=encoded_inputs, src_key_padding_mask=mask)
+        shared_latent = self.bahdanau_attention(extracted_features, mask, encoded_drones.reshape(batch_size, -1))
+
+        return self.policy_net(shared_latent), self.value_net(shared_latent)
 
 
 def create_mlp(

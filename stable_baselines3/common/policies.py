@@ -26,6 +26,7 @@ from stable_baselines3.common.torch_layers import (
     CombinedExtractor,
     FlattenExtractor,
     MlpExtractor,
+    TransformerExtractor,
     NatureCNN,
     create_mlp,
 )
@@ -490,12 +491,14 @@ class ActorCriticPolicy(BasePolicy):
         # Note: If net_arch is None and some features extractor is used,
         #       net_arch here is an empty list and mlp_extractor does not
         #       really contain any layers (acts like an identity module).
-        self.mlp_extractor = MlpExtractor(
-            self.features_dim,
-            net_arch=self.net_arch,
-            activation_fn=self.activation_fn,
-            device=self.device,
-        )
+        #self.mlp_extractor = MlpExtractor(
+        #    self.features_dim,
+        #    net_arch=self.net_arch,
+        #    activation_fn=self.activation_fn,
+        #    device=self.device,
+        #)
+
+        self.mlp_extractor = TransformerExtractor()
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
